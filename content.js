@@ -48,6 +48,8 @@ class AudioInterceptor {
     this.handles      = new Map();
     this.enabled      = false;
     this.strength     = 0.7;
+    this.mode         = 'all';
+    this.blacklist    = [];
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -68,6 +70,10 @@ class AudioInterceptor {
     if (this.ctx.state === 'suspended') {
       this.ctx.resume().catch(() => {});
     }
+    // Re-activate worklet on handles that were bypassed during disable()
+    for (const h of this.handles.values()) {
+      h.workletNode.port.postMessage({ enabled: true });
+    }
     for (const el of document.querySelectorAll('audio, video')) {
       this._attach(el);
     }
@@ -78,19 +84,21 @@ class AudioInterceptor {
   disable() {
     this.enabled = false;
     this._stopObserver();
+    const toRemove = [];
     for (const [el, h] of this.handles) {
-      h.workletNode.disconnect();
-      h.source.disconnect();
-      if (h.strategy === 'capture') el.muted = false;
+      if (h.strategy === 'capture') {
+        h.workletNode.disconnect();
+        h.source.disconnect();
+        el.muted = false;
+        toRemove.push(el);
+      } else {
+        // Put the worklet in bypass mode instead of closing the AudioContext.
+        // ctx.close() disconnects the createMediaElementSource binding and
+        // disrupts the media element's playback pipeline, freezing the stream.
+        h.workletNode.port.postMessage({ enabled: false });
+      }
     }
-    this.handles.clear();
-    // Closing the context releases createMediaElementSource bindings,
-    // which restores each element's native audio output.
-    if (this.ctx) {
-      this.ctx.close().catch(() => {});
-      this.ctx = null;
-      this.workletReady = false;
-    }
+    for (const el of toRemove) this.handles.delete(el);
     this._broadcastStatus();
   }
 
@@ -108,6 +116,10 @@ class AudioInterceptor {
     if (!(el instanceof HTMLMediaElement)) return;
     if (this.handles.has(el)) return;
     if (!this.workletReady) return;
+    // Guard: SPA navigation changes window.location.href before RECHECK arrives.
+    // Check the current URL synchronously so we never call createMediaElementSource
+    // or captureStream on a stream that belongs to a non-active page.
+    if (!shouldActivate({ enabled: this.enabled, mode: this.mode, blacklist: this.blacklist })) return;
 
     let handle = null;
 
@@ -216,7 +228,9 @@ document.addEventListener('touchstart', resumeOnGesture, { passive: true });
 
 // Initial state load
 chrome.storage.local.get(['enabled', 'strength', 'mode', 'blacklist'], (data) => {
-  if (data.strength !== undefined) interceptor.strength = data.strength;
+  if (data.strength !== undefined) interceptor.strength     = data.strength;
+  interceptor.mode      = data.mode      ?? 'all';
+  interceptor.blacklist = data.blacklist ?? [];
   if (shouldActivate(data)) interceptor.enable();
 });
 
@@ -224,6 +238,8 @@ chrome.storage.local.get(['enabled', 'strength', 'mode', 'blacklist'], (data) =>
 chrome.storage.onChanged.addListener((changes) => {
   if (!('enabled' in changes) && !('mode' in changes) && !('blacklist' in changes)) return;
   chrome.storage.local.get(['enabled', 'mode', 'blacklist'], (data) => {
+    interceptor.mode      = data.mode      ?? 'all';
+    interceptor.blacklist = data.blacklist ?? [];
     const active = shouldActivate(data);
     if (active && !interceptor.enabled)  interceptor.enable();
     if (!active && interceptor.enabled)  interceptor.disable();
@@ -236,6 +252,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     case 'SET_STATUS': {
       chrome.storage.local.get(['mode', 'blacklist'], (data) => {
+        interceptor.mode      = data.mode      ?? 'all';
+        interceptor.blacklist = data.blacklist ?? [];
         const active = shouldActivate({ enabled: msg.enabled, ...data });
         if (active)  interceptor.enable();
         else         interceptor.disable();
@@ -253,6 +271,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // Background tells us to re-evaluate (mode or blacklist changed)
     case 'RECHECK': {
       chrome.storage.local.get(['enabled', 'mode', 'blacklist'], (data) => {
+        interceptor.mode      = data.mode      ?? 'all';
+        interceptor.blacklist = data.blacklist ?? [];
         const active = shouldActivate(data);
         if (active && !interceptor.enabled)  interceptor.enable();
         if (!active && interceptor.enabled)  interceptor.disable();
