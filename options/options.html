@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NoMusic — Options</title>
+  <link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <img src="../icons/icon48.png" alt="NoMusic icon" />
+      <h1>NoMusic Options</h1>
+    </header>
+
+    <!-- Mode section -->
+    <section>
+      <h2>Activation mode</h2>
+      <div class="mode-options">
+        <label class="radio-card" id="card-all">
+          <input type="radio" name="mode" value="all" />
+          <div class="radio-body">
+            <span class="radio-title">All pages</span>
+            <span class="radio-desc">Suppress background music on every site automatically.</span>
+          </div>
+        </label>
+        <label class="radio-card" id="card-blacklist">
+          <input type="radio" name="mode" value="blacklist" />
+          <div class="radio-body">
+            <span class="radio-title">Selected pages only</span>
+            <span class="radio-desc">Only activate on pages whose URL matches an entry in your list below.</span>
+          </div>
+        </label>
+      </div>
+    </section>
+
+    <!-- Page list section — only enabled when mode = blacklist -->
+    <section id="list-section" class="list-section">
+      <h2>Page list</h2>
+      <p class="hint">
+        Enter a fully-qualified URL or use <code>*</code> as a wildcard.<br/>
+        Examples: <code>https://www.twitch.tv/*</code> &nbsp;·&nbsp;
+        <code>https://youtube.com/watch?v=*</code>
+      </p>
+
+      <div class="add-row">
+        <input
+          type="url"
+          id="new-url"
+          class="url-input"
+          placeholder="https://example.com/*"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button id="add-btn" type="button">Add</button>
+      </div>
+
+      <ul id="url-list" class="url-list" aria-label="Blocked pages"></ul>
+
+      <p id="empty-msg" class="empty-msg">No pages added yet.</p>
+    </section>
+
+    <div class="save-bar">
+      <button id="save-btn" type="button">Save</button>
+      <span id="status-msg" class="status-msg" aria-live="polite"></span>
+    </div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NoMusic</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <img src="../icons/icon48.png" alt="NoMusic icon" class="logo" />
+      <div class="title-block">
+        <h1>NoMusic</h1>
+        <span id="status-badge" class="badge off">off</span>
+      </div>
+    </header>
+
+    <main>
+      <!-- Master toggle -->
+      <label class="toggle-row">
+        <span class="label">Enable music removal</span>
+        <input type="checkbox" id="toggle" />
+        <span class="slider"></span>
+      </label>
+
+      <!-- Mode selector -->
+      <div class="mode-row">
+        <span class="label">Active on</span>
+        <div class="seg" id="mode-seg" role="group" aria-label="Activation mode">
+          <button class="seg-btn" data-mode="all">All pages</button>
+          <button class="seg-btn" data-mode="blacklist">Selected pages</button>
+        </div>
+      </div>
+
+      <!-- Blacklist actions — only visible in blacklist mode -->
+      <div id="blacklist-row" class="blacklist-row hidden">
+        <span id="page-status" class="page-status"></span>
+        <button id="add-page-btn" class="add-btn">+ Add this site</button>
+      </div>
+
+      <!-- Strength slider -->
+      <div class="strength-row">
+        <label for="strength" class="label">Suppression strength</label>
+        <div class="slider-track">
+          <input type="range" id="strength" min="0" max="100" value="70" />
+          <span id="strength-val">70%</span>
+        </div>
+      </div>
+
+      <!-- Live active indicator -->
+      <div id="active-row" class="active-row hidden">
+        <span class="dot"></span>
+        <span id="active-label">Processing 0 stream(s)</span>
+      </div>
+    </main>
+
+    <footer>
+      <a id="options-link" href="#">Manage page list</a>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
