@@ -4,7 +4,10 @@ Bro I cannot stand pikaboo's music playlist anymore.
 
 Yes, AI dogslop.
 
-Download the whole folder. Chrome- Manage extensions, enable developer mode, load unpacked, select this folder. Go for it.
+Download the whole folder. 
+
+CHROME ONLY- 
+Manage extensions, enable developer mode, load unpacked, select this folder. Go for it.
 
 Dantes stream is also a true test of this working. Dear lord the music is so loud
 
