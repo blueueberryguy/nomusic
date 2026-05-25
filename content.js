@@ -44,6 +44,8 @@ class AudioInterceptor {
   constructor() {
     this.ctx          = null;
     this.workletReady = false;
+    this.wasmModule   = null;  // ArrayBuffer of df_bg.wasm
+    this.modelBuffer  = null;  // ArrayBuffer of deepfilter3.tar.gz
     /** @type {Map<HTMLMediaElement, object>} */
     this.handles      = new Map();
     this.enabled      = false;
@@ -58,6 +60,14 @@ class AudioInterceptor {
     if (this.ctx) return;
     this.ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'playback' });
     await this.ctx.audioWorklet.addModule(WORKLET_URL);
+
+    const [wasmBuf, modelBuf] = await Promise.all([
+      fetch(chrome.runtime.getURL('audio/df_bg.wasm')).then(r => r.arrayBuffer()),
+      fetch(chrome.runtime.getURL('audio/deepfilter3.tar.gz')).then(r => r.arrayBuffer()),
+    ]);
+    this.wasmModule  = wasmBuf;
+    this.modelBuffer = modelBuf;
+
     this.workletReady = true;
   }
 
@@ -72,7 +82,7 @@ class AudioInterceptor {
     }
     // Re-activate worklet on handles that were bypassed during disable()
     for (const h of this.handles.values()) {
-      h.workletNode.port.postMessage({ enabled: true });
+      h.workletNode.port.postMessage({ type: 'SET_BYPASS', value: false });
     }
     for (const el of document.querySelectorAll('audio, video')) {
       this._attach(el);
@@ -95,7 +105,7 @@ class AudioInterceptor {
         // Put the worklet in bypass mode instead of closing the AudioContext.
         // ctx.close() disconnects the createMediaElementSource binding and
         // disrupts the media element's playback pipeline, freezing the stream.
-        h.workletNode.port.postMessage({ enabled: false });
+        h.workletNode.port.postMessage({ type: 'SET_BYPASS', value: true });
       }
     }
     for (const el of toRemove) this.handles.delete(el);
@@ -104,9 +114,8 @@ class AudioInterceptor {
 
   setStrength(strength) {
     this.strength = strength;
-    const overSubtract = 1.0 + strength * 2.5;
     for (const h of this.handles.values()) {
-      h.workletNode.port.postMessage({ overSubtract });
+      h.workletNode.port.postMessage({ type: 'SET_SUPPRESSION_LEVEL', value: Math.round(strength * 100) });
     }
   }
 
@@ -167,14 +176,13 @@ class AudioInterceptor {
     const node = new AudioWorkletNode(this.ctx, 'nomusic-enhancer', {
       numberOfInputs:   1,
       numberOfOutputs:  1,
-      channelCount:     2,
+      channelCount:     1,
       channelCountMode: 'explicit',
-    });
-    node.port.postMessage({
-      overSubtract:  1.0 + this.strength * 2.5,
-      noiseAlpha:    0.9997,
-      spectralFloor: 0.05,
-      enabled:       true,
+      processorOptions: {
+        wasmModule:       this.wasmModule,
+        modelBytes:       this.modelBuffer,
+        suppressionLevel: Math.round(this.strength * 100),
+      },
     });
     return node;
   }

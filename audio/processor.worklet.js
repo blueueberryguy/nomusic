@@ -1,224 +1,420 @@
-/**
- * AudioWorkletProcessor — real-time music suppression via STFT Wiener filtering.
- *
- * Algorithm:
- *   1. Buffer input into overlapping frames (512 samples, 50% hop).
- *   2. Apply Hann analysis window and forward FFT.
- *   3. Maintain a slow-adapting power estimate of the background (≈ music).
- *   4. Apply a per-bin Wiener gain that suppresses the background estimate
- *      while protecting bins in the 300–3500 Hz speech range.
- *   5. IFFT + overlap-add for continuous output.
- *
- * The Hann window at 50% overlap satisfies COLA (sum = 1), so no synthesis
- * window or extra scale factor is needed for OLA reconstruction.
- */
+(function () {
+    'use strict';
 
-const FFT_SIZE = 512;
-const HOP_SIZE = 256; // 50% overlap
+    let wasm;
 
-// ─── Pure Cooley-Tukey DIT FFT ───────────────────────────────────────────────
-function fft(re, im) {
-  const n = re.length;
-  // Bit-reversal permutation
-  for (let i = 1, j = 0; i < n; i++) {
-    let bit = n >> 1;
-    for (; j & bit; bit >>= 1) j ^= bit;
-    j ^= bit;
-    if (i < j) {
-      let t = re[i]; re[i] = re[j]; re[j] = t;
-      t = im[i]; im[i] = im[j]; im[j] = t;
-    }
-  }
-  // Butterfly passes
-  for (let len = 2; len <= n; len <<= 1) {
-    const half = len >> 1;
-    const ang = -Math.PI / half;
-    for (let i = 0; i < n; i += len) {
-      for (let k = 0; k < half; k++) {
-        const cos = Math.cos(ang * k);
-        const sin = Math.sin(ang * k);
-        const tRe = cos * re[i + k + half] - sin * im[i + k + half];
-        const tIm = cos * im[i + k + half] + sin * re[i + k + half];
-        re[i + k + half] = re[i + k] - tRe;
-        im[i + k + half] = im[i + k] - tIm;
-        re[i + k] += tRe;
-        im[i + k] += tIm;
-      }
-    }
-  }
-}
+    const heap = new Array(128).fill(undefined);
 
-function ifft(re, im) {
-  const n = re.length;
-  // Conjugate → FFT → conjugate → normalise
-  for (let i = 0; i < n; i++) im[i] = -im[i];
-  fft(re, im);
-  for (let i = 0; i < n; i++) { im[i] = -im[i]; re[i] /= n; im[i] /= n; }
-}
+    heap.push(undefined, null, true, false);
 
-// ─── Per-channel processing state ────────────────────────────────────────────
-function makeChannelState(fftSize, sampleRate) {
-  const N2 = fftSize / 2 + 1;
+    function getObject(idx) { return heap[idx]; }
 
-  // Voice-frequency protection weight per FFT bin.
-  // Higher = protect this bin more (less aggressive suppression).
-  const binHz = sampleRate / fftSize;
-  const voiceWeight = new Float32Array(N2);
-  for (let k = 0; k < N2; k++) {
-    const hz = k * binHz;
-    if      (hz <  80)   voiceWeight[k] = 0.00;  // sub-bass: suppress freely
-    else if (hz <  300)  voiceWeight[k] = 0.20;  // low fundamentals
-    else if (hz < 3500)  voiceWeight[k] = 0.85;  // core speech formants: protect
-    else if (hz < 8000)  voiceWeight[k] = 0.50;  // sibilants / upper harmonics
-    else                 voiceWeight[k] = 0.10;  // high freq: mostly music
-  }
+    let heap_next = heap.length;
 
-  return {
-    inBuf:      new Float32Array(fftSize),
-    inFill:     0,
-    outQueue:   [],
-    olaBuf:     new Float32Array(fftSize * 2), // double-length ring buffer
-    olaPos:     0,
-    noiseEst:   new Float32Array(N2).fill(1e-8),
-    initialized: false,
-    voiceWeight,
-  };
-}
-
-// ─── Processor ───────────────────────────────────────────────────────────────
-class SpeechEnhancer extends AudioWorkletProcessor {
-  constructor() {
-    super();
-
-    this.fftSize  = FFT_SIZE;
-    this.hopSize  = HOP_SIZE;
-    this.enabled  = true;
-
-    // Wiener filter parameters (tunable at runtime from popup)
-    this.noiseAlpha    = 0.9997; // background estimation rate (~3 s half-life at 48 kHz)
-    this.overSubtract  = 2.2;    // aggressiveness (higher → more suppression)
-    this.spectralFloor = 0.05;   // minimum Wiener gain (prevents full silence)
-
-    // Hann analysis window
-    this.window = new Float32Array(this.fftSize);
-    for (let i = 0; i < this.fftSize; i++) {
-      this.window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / this.fftSize));
+    function dropObject(idx) {
+        if (idx < 132) return;
+        heap[idx] = heap_next;
+        heap_next = idx;
     }
 
-    // Working arrays (re-used every frame to avoid GC)
-    this.re = new Float32Array(this.fftSize);
-    this.im = new Float32Array(this.fftSize);
-
-    // Up to 2 channels of per-channel state
-    this.chState = [
-      makeChannelState(this.fftSize, sampleRate),
-      makeChannelState(this.fftSize, sampleRate),
-    ];
-
-    this.port.onmessage = ({ data }) => {
-      if (data.noiseAlpha    !== undefined) this.noiseAlpha    = data.noiseAlpha;
-      if (data.overSubtract  !== undefined) this.overSubtract  = data.overSubtract;
-      if (data.spectralFloor !== undefined) this.spectralFloor = data.spectralFloor;
-      if (data.enabled       !== undefined) this.enabled       = data.enabled;
-    };
-  }
-
-  /** Process one 512-sample frame for a single channel. */
-  processFrame(st) {
-    const N  = this.fftSize;
-    const N2 = N / 2 + 1;
-    const re = this.re;
-    const im = this.im;
-
-    // Windowed input
-    for (let i = 0; i < N; i++) { re[i] = st.inBuf[i] * this.window[i]; im[i] = 0; }
-
-    fft(re, im);
-
-    // Power spectrum + phase
-    const power = new Float32Array(N2);
-    const phase = new Float32Array(N2);
-    for (let k = 0; k < N2; k++) {
-      power[k] = re[k] * re[k] + im[k] * im[k];
-      phase[k] = Math.atan2(im[k], re[k]);
+    function takeObject(idx) {
+        const ret = getObject(idx);
+        dropObject(idx);
+        return ret;
     }
 
-    // First frame: seed the noise estimate
-    if (!st.initialized) { st.noiseEst.set(power); st.initialized = true; }
+    const cachedTextDecoder = (typeof TextDecoder !== 'undefined' ? new TextDecoder('utf-8', { ignoreBOM: true, fatal: true }) : { decode: () => { throw Error('TextDecoder not available') } } );
 
-    // Slow background power estimate.
-    // At voice bins, adapt even more slowly so momentary speech doesn't
-    // corrupt the music estimate.
-    for (let k = 0; k < N2; k++) {
-      const alpha = this.noiseAlpha + (1 - this.noiseAlpha) * st.voiceWeight[k] * 0.6;
-      st.noiseEst[k] = alpha * st.noiseEst[k] + (1 - alpha) * power[k];
-    }
+    if (typeof TextDecoder !== 'undefined') { cachedTextDecoder.decode(); }
+    let cachedUint8Memory0 = null;
 
-    // Per-bin Wiener gain: H(k) = max(floor, 1 − α·noise/signal)
-    // Reduce oversubtraction aggressiveness at protected voice bins.
-    for (let k = 0; k < N2; k++) {
-      const sig = Math.max(power[k], 1e-12);
-      const alpha = this.overSubtract * (1 - st.voiceWeight[k] * 0.75);
-      const H = Math.max(this.spectralFloor, 1 - alpha * st.noiseEst[k] / sig);
-      const mag = Math.sqrt(power[k]) * H;
-      re[k] = mag * Math.cos(phase[k]);
-      im[k] = mag * Math.sin(phase[k]);
-    }
-    // Conjugate symmetry for real IFFT
-    for (let k = N2; k < N; k++) { re[k] = re[N - k]; im[k] = -im[N - k]; }
-
-    ifft(re, im);
-
-    // Overlap-add (no synthesis window needed; Hann COLA at 50% overlap = 1)
-    const olaLen = st.olaBuf.length;
-    for (let j = 0; j < N; j++) {
-      st.olaBuf[(st.olaPos + j) % olaLen] += re[j];
-    }
-    for (let j = 0; j < this.hopSize; j++) {
-      const pos = (st.olaPos + j) % olaLen;
-      st.outQueue.push(st.olaBuf[pos]);
-      st.olaBuf[pos] = 0;
-    }
-    st.olaPos = (st.olaPos + this.hopSize) % olaLen;
-
-    // Shift input buffer by one hop
-    st.inBuf.copyWithin(0, this.hopSize);
-    st.inFill = N - this.hopSize;
-  }
-
-  process(inputs, outputs) {
-    const inputChannels  = (inputs[0]  || []);
-    const outputChannels = (outputs[0] || []);
-    const numCh = Math.min(Math.max(inputChannels.length, 1), 2);
-
-    for (let c = 0; c < numCh; c++) {
-      const inData = inputChannels[c];
-      if (!inData) continue;
-      const st = this.chState[c];
-
-      if (!this.enabled) {
-        // Bypass: copy input straight through
-        if (outputChannels[c]) outputChannels[c].set(inData);
-        continue;
-      }
-
-      // Buffer incoming 128-sample block
-      for (let i = 0; i < inData.length; i++) {
-        st.inBuf[st.inFill++] = inData[i];
-        if (st.inFill >= this.fftSize) this.processFrame(st);
-      }
-
-      // Drain the output queue into the output buffer
-      const out = outputChannels[c];
-      if (out) {
-        for (let i = 0; i < out.length; i++) {
-          out[i] = st.outQueue.length ? st.outQueue.shift() : 0;
+    function getUint8Memory0() {
+        if (cachedUint8Memory0 === null || cachedUint8Memory0.byteLength === 0) {
+            cachedUint8Memory0 = new Uint8Array(wasm.memory.buffer);
         }
-      }
+        return cachedUint8Memory0;
     }
 
-    return true;
-  }
-}
+    function getStringFromWasm0(ptr, len) {
+        ptr = ptr >>> 0;
+        return cachedTextDecoder.decode(getUint8Memory0().subarray(ptr, ptr + len));
+    }
 
-registerProcessor('nomusic-enhancer', SpeechEnhancer);
+    function addHeapObject(obj) {
+        if (heap_next === heap.length) heap.push(heap.length + 1);
+        const idx = heap_next;
+        heap_next = heap[idx];
+
+        heap[idx] = obj;
+        return idx;
+    }
+    /**
+    * Set DeepFilterNet attenuation limit.
+    *
+    * Args:
+    *     - lim_db: New attenuation limit in dB.
+    * @param {number} st
+    * @param {number} lim_db
+    */
+    function df_set_atten_lim(st, lim_db) {
+        wasm.df_set_atten_lim(st, lim_db);
+    }
+
+    /**
+    * Get DeepFilterNet frame size in samples.
+    * @param {number} st
+    * @returns {number}
+    */
+    function df_get_frame_length(st) {
+        const ret = wasm.df_get_frame_length(st);
+        return ret >>> 0;
+    }
+
+    let WASM_VECTOR_LEN = 0;
+
+    function passArray8ToWasm0(arg, malloc) {
+        const ptr = malloc(arg.length * 1, 1) >>> 0;
+        getUint8Memory0().set(arg, ptr / 1);
+        WASM_VECTOR_LEN = arg.length;
+        return ptr;
+    }
+    /**
+    * Create a DeepFilterNet Model
+    *
+    * Args:
+    *     - path: File path to a DeepFilterNet tar.gz onnx model
+    *     - atten_lim: Attenuation limit in dB.
+    *
+    * Returns:
+    *     - DF state doing the full processing: stft, DNN noise reduction, istft.
+    * @param {Uint8Array} model_bytes
+    * @param {number} atten_lim
+    * @returns {number}
+    */
+    function df_create(model_bytes, atten_lim) {
+        const ptr0 = passArray8ToWasm0(model_bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.df_create(ptr0, len0, atten_lim);
+        return ret >>> 0;
+    }
+
+    let cachedFloat32Memory0 = null;
+
+    function getFloat32Memory0() {
+        if (cachedFloat32Memory0 === null || cachedFloat32Memory0.byteLength === 0) {
+            cachedFloat32Memory0 = new Float32Array(wasm.memory.buffer);
+        }
+        return cachedFloat32Memory0;
+    }
+
+    function passArrayF32ToWasm0(arg, malloc) {
+        const ptr = malloc(arg.length * 4, 4) >>> 0;
+        getFloat32Memory0().set(arg, ptr / 4);
+        WASM_VECTOR_LEN = arg.length;
+        return ptr;
+    }
+    /**
+    * Processes a chunk of samples.
+    *
+    * Args:
+    *     - df_state: Created via df_create()
+    *     - input: Input buffer of length df_get_frame_length()
+    *     - output: Output buffer of length df_get_frame_length()
+    *
+    * Returns:
+    *     - Local SNR of the current frame.
+    * @param {number} st
+    * @param {Float32Array} input
+    * @returns {Float32Array}
+    */
+    function df_process_frame(st, input) {
+        const ptr0 = passArrayF32ToWasm0(input, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.df_process_frame(st, ptr0, len0);
+        return takeObject(ret);
+    }
+
+    function handleError(f, args) {
+        try {
+            return f.apply(this, args);
+        } catch (e) {
+            wasm.__wbindgen_exn_store(addHeapObject(e));
+        }
+    }
+
+    (typeof FinalizationRegistry === 'undefined')
+        ? { }
+        : new FinalizationRegistry(ptr => wasm.__wbg_dfstate_free(ptr >>> 0));
+
+    function __wbg_get_imports() {
+        const imports = {};
+        imports.wbg = {};
+        imports.wbg.__wbindgen_object_drop_ref = function(arg0) {
+            takeObject(arg0);
+        };
+        imports.wbg.__wbg_crypto_566d7465cdbb6b7a = function(arg0) {
+            const ret = getObject(arg0).crypto;
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbindgen_is_object = function(arg0) {
+            const val = getObject(arg0);
+            const ret = typeof(val) === 'object' && val !== null;
+            return ret;
+        };
+        imports.wbg.__wbg_process_dc09a8c7d59982f6 = function(arg0) {
+            const ret = getObject(arg0).process;
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_versions_d98c6400c6ca2bd8 = function(arg0) {
+            const ret = getObject(arg0).versions;
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_node_caaf83d002149bd5 = function(arg0) {
+            const ret = getObject(arg0).node;
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbindgen_is_string = function(arg0) {
+            const ret = typeof(getObject(arg0)) === 'string';
+            return ret;
+        };
+        imports.wbg.__wbg_require_94a9da52636aacbf = function() { return handleError(function () {
+            const ret = module.require;
+            return addHeapObject(ret);
+        }, arguments) };
+        imports.wbg.__wbindgen_is_function = function(arg0) {
+            const ret = typeof(getObject(arg0)) === 'function';
+            return ret;
+        };
+        imports.wbg.__wbindgen_string_new = function(arg0, arg1) {
+            const ret = getStringFromWasm0(arg0, arg1);
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_msCrypto_0b84745e9245cdf6 = function(arg0) {
+            const ret = getObject(arg0).msCrypto;
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_randomFillSync_290977693942bf03 = function() { return handleError(function (arg0, arg1) {
+            getObject(arg0).randomFillSync(takeObject(arg1));
+        }, arguments) };
+        imports.wbg.__wbg_getRandomValues_260cc23a41afad9a = function() { return handleError(function (arg0, arg1) {
+            getObject(arg0).getRandomValues(getObject(arg1));
+        }, arguments) };
+        imports.wbg.__wbg_newnoargs_e258087cd0daa0ea = function(arg0, arg1) {
+            const ret = new Function(getStringFromWasm0(arg0, arg1));
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_new_63b92bc8671ed464 = function(arg0) {
+            const ret = new Uint8Array(getObject(arg0));
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_new_9efabd6b6d2ce46d = function(arg0) {
+            const ret = new Float32Array(getObject(arg0));
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_buffer_12d079cc21e14bdb = function(arg0) {
+            const ret = getObject(arg0).buffer;
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_newwithbyteoffsetandlength_aa4a17c33a06e5cb = function(arg0, arg1, arg2) {
+            const ret = new Uint8Array(getObject(arg0), arg1 >>> 0, arg2 >>> 0);
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_newwithlength_e9b4878cebadb3d3 = function(arg0) {
+            const ret = new Uint8Array(arg0 >>> 0);
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_set_a47bac70306a19a7 = function(arg0, arg1, arg2) {
+            getObject(arg0).set(getObject(arg1), arg2 >>> 0);
+        };
+        imports.wbg.__wbg_subarray_a1f73cd4b5b42fe1 = function(arg0, arg1, arg2) {
+            const ret = getObject(arg0).subarray(arg1 >>> 0, arg2 >>> 0);
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_newwithbyteoffsetandlength_4a659d079a1650e0 = function(arg0, arg1, arg2) {
+            const ret = new Float32Array(getObject(arg0), arg1 >>> 0, arg2 >>> 0);
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_self_ce0dbfc45cf2f5be = function() { return handleError(function () {
+            const ret = self.self;
+            return addHeapObject(ret);
+        }, arguments) };
+        imports.wbg.__wbg_window_c6fb939a7f436783 = function() { return handleError(function () {
+            const ret = window.window;
+            return addHeapObject(ret);
+        }, arguments) };
+        imports.wbg.__wbg_globalThis_d1e6af4856ba331b = function() { return handleError(function () {
+            const ret = globalThis.globalThis;
+            return addHeapObject(ret);
+        }, arguments) };
+        imports.wbg.__wbg_global_207b558942527489 = function() { return handleError(function () {
+            const ret = global.global;
+            return addHeapObject(ret);
+        }, arguments) };
+        imports.wbg.__wbindgen_is_undefined = function(arg0) {
+            const ret = getObject(arg0) === undefined;
+            return ret;
+        };
+        imports.wbg.__wbg_call_27c0f87801dedf93 = function() { return handleError(function (arg0, arg1) {
+            const ret = getObject(arg0).call(getObject(arg1));
+            return addHeapObject(ret);
+        }, arguments) };
+        imports.wbg.__wbindgen_object_clone_ref = function(arg0) {
+            const ret = getObject(arg0);
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbg_call_b3ca7c6051f9bec1 = function() { return handleError(function (arg0, arg1, arg2) {
+            const ret = getObject(arg0).call(getObject(arg1), getObject(arg2));
+            return addHeapObject(ret);
+        }, arguments) };
+        imports.wbg.__wbindgen_memory = function() {
+            const ret = wasm.memory;
+            return addHeapObject(ret);
+        };
+        imports.wbg.__wbindgen_throw = function(arg0, arg1) {
+            throw new Error(getStringFromWasm0(arg0, arg1));
+        };
+
+        return imports;
+    }
+
+    function __wbg_finalize_init(instance, module) {
+        wasm = instance.exports;
+        cachedFloat32Memory0 = null;
+        cachedUint8Memory0 = null;
+
+
+        return wasm;
+    }
+
+    function initSync(module) {
+        if (wasm !== undefined) return wasm;
+
+        const imports = __wbg_get_imports();
+
+        if (!(module instanceof WebAssembly.Module)) {
+            module = new WebAssembly.Module(module);
+        }
+
+        const instance = new WebAssembly.Instance(module, imports);
+
+        return __wbg_finalize_init(instance);
+    }
+
+    const WorkletMessageTypes = {
+        SET_SUPPRESSION_LEVEL: 'SET_SUPPRESSION_LEVEL',
+        SET_BYPASS: 'SET_BYPASS'
+    };
+
+    class DeepFilterAudioProcessor extends AudioWorkletProcessor {
+        constructor(options) {
+            super();
+            this.dfModel = null;
+            this.inputWritePos = 0;
+            this.inputReadPos = 0;
+            this.outputWritePos = 0;
+            this.outputReadPos = 0;
+            this.bypass = false;
+            this.isInitialized = false;
+            this.tempFrame = null;
+            this.bufferSize = 8192;
+            this.inputBuffer = new Float32Array(this.bufferSize);
+            this.outputBuffer = new Float32Array(this.bufferSize);
+            try {
+                // Initialize WASM from pre-compiled module
+                initSync(options.processorOptions.wasmModule);
+                const modelBytes = new Uint8Array(options.processorOptions.modelBytes);
+                const handle = df_create(modelBytes, options.processorOptions.suppressionLevel ?? 50);
+                const frameLength = df_get_frame_length(handle);
+                this.dfModel = { handle, frameLength };
+                this.bufferSize = frameLength * 4;
+                this.inputBuffer = new Float32Array(this.bufferSize);
+                this.outputBuffer = new Float32Array(this.bufferSize);
+                // Pre-allocate temp frame buffer for processing
+                this.tempFrame = new Float32Array(frameLength);
+                this.isInitialized = true;
+                this.port.onmessage = (event) => {
+                    this.handleMessage(event.data);
+                };
+            }
+            catch (error) {
+                console.error('Failed to initialize DeepFilter in AudioWorklet:', error);
+                this.isInitialized = false;
+            }
+        }
+        handleMessage(data) {
+            switch (data.type) {
+                case WorkletMessageTypes.SET_SUPPRESSION_LEVEL:
+                    if (this.dfModel && typeof data.value === 'number') {
+                        const level = Math.max(0, Math.min(100, Math.floor(data.value)));
+                        df_set_atten_lim(this.dfModel.handle, level);
+                    }
+                    break;
+                case WorkletMessageTypes.SET_BYPASS:
+                    this.bypass = Boolean(data.value);
+                    break;
+            }
+        }
+        getInputAvailable() {
+            return (this.inputWritePos - this.inputReadPos + this.bufferSize) % this.bufferSize;
+        }
+        getOutputAvailable() {
+            return (this.outputWritePos - this.outputReadPos + this.bufferSize) % this.bufferSize;
+        }
+        process(inputList, outputList) {
+            const sourceLimit = Math.min(inputList.length, outputList.length);
+            const input = inputList[0]?.[0];
+            if (!input) {
+                return true;
+            }
+            // Passthrough mode - copy input to all output channels
+            if (!this.isInitialized || !this.dfModel || this.bypass || !this.tempFrame) {
+                for (let inputNum = 0; inputNum < sourceLimit; inputNum++) {
+                    const output = outputList[inputNum];
+                    const channelCount = output.length;
+                    for (let channelNum = 0; channelNum < channelCount; channelNum++) {
+                        output[channelNum].set(input);
+                    }
+                }
+                return true;
+            }
+            // Write input to ring buffer
+            for (let i = 0; i < input.length; i++) {
+                this.inputBuffer[this.inputWritePos] = input[i];
+                this.inputWritePos = (this.inputWritePos + 1) % this.bufferSize;
+            }
+            const frameLength = this.dfModel.frameLength;
+            while (this.getInputAvailable() >= frameLength) {
+                // Extract frame from ring buffer
+                for (let i = 0; i < frameLength; i++) {
+                    this.tempFrame[i] = this.inputBuffer[this.inputReadPos];
+                    this.inputReadPos = (this.inputReadPos + 1) % this.bufferSize;
+                }
+                const processed = df_process_frame(this.dfModel.handle, this.tempFrame);
+                // Write to output ring buffer
+                for (let i = 0; i < processed.length; i++) {
+                    this.outputBuffer[this.outputWritePos] = processed[i];
+                    this.outputWritePos = (this.outputWritePos + 1) % this.bufferSize;
+                }
+            }
+            const outputAvailable = this.getOutputAvailable();
+            if (outputAvailable >= 128) {
+                for (let inputNum = 0; inputNum < sourceLimit; inputNum++) {
+                    const output = outputList[inputNum];
+                    const channelCount = output.length;
+                    for (let channelNum = 0; channelNum < channelCount; channelNum++) {
+                        const outputChannel = output[channelNum];
+                        let readPos = this.outputReadPos;
+                        for (let i = 0; i < 128; i++) {
+                            outputChannel[i] = this.outputBuffer[readPos];
+                            readPos = (readPos + 1) % this.bufferSize;
+                        }
+                    }
+                }
+                this.outputReadPos = (this.outputReadPos + 128) % this.bufferSize;
+            }
+            return true;
+        }
+    }
+    registerProcessor('nomusic-enhancer', DeepFilterAudioProcessor);
+
+})();

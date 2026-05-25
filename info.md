@@ -8,7 +8,17 @@ NoMusic is a Chrome extension that removes background music from video and audio
 
 ## How Background Audio Suppression Works
 
-Suppression runs entirely in-browser using an AudioWorklet processor (`audio/processor.worklet.js`). No audio data leaves your machine.
+Suppression runs entirely in-browser using a DeepFilterNet3 AudioWorklet processor (`audio/processor.worklet.js`). No audio data leaves your machine.
+
+### Algorithm — DeepFilterNet3
+
+NoMusic uses **DeepFilterNet3**, a deep neural network trained to separate speech from all types of background noise — including tonal music, which simpler signal-processing approaches struggle with. The model runs inside a Web Audio `AudioWorkletProcessor` compiled to WebAssembly.
+
+DeepFilterNet3 operates in two stages on every audio frame:
+- **ERB-based sub-band filtering** — The spectrum is decomposed into Equivalent Rectangular Bandwidth bands that match human auditory perception. A recurrent network estimates a complex ratio filter for each band, attenuating non-speech energy while preserving speech harmonics and formants.
+- **Deep filtering** — A second network refines the output in the high-frequency region where tonal music artifacts concentrate, applying a frame-level complex mask that would be too expensive to apply across all bands.
+
+The result is clean, natural-sounding speech even in the presence of broadcast-level background music — something a hand-tuned Wiener filter cannot reliably achieve.
 
 ### Pipeline
 
@@ -16,36 +26,18 @@ Suppression runs entirely in-browser using an AudioWorklet processor (`audio/pro
    - First attempt: `createMediaElementSource()` — cleanest path; Chrome silences the element and routes audio into the Web Audio graph automatically.
    - Fallback: `captureStream()` — used when the first attempt fails due to CORS restrictions. The element is muted manually and its stream is fed into the graph instead.
 
-2. **Buffer & Window** — Incoming audio is buffered into 512-sample frames with a 50% overlap (256-sample hop). A Hann window is applied to each frame before transform.
+2. **Worklet init** — On first enable, the content script fetches `df_bg.wasm` (the compiled DeepFilterNet3 Rust module) and `deepfilter3.tar.gz` (the ONNX model weights) from the extension's local files and passes them into the `AudioWorkletNode` via `processorOptions`. The worklet calls `initSync()` and `df_create()` once to set up the model state. All subsequent processing happens on the AudioWorklet thread, keeping the main thread free.
 
-3. **FFT** — A pure Cooley-Tukey DIT FFT converts each windowed frame into the frequency domain.
+3. **Frame processing** — The worklet processes audio at 48 kHz in mono. Each call to `process()` feeds samples into the DeepFilterNet3 frame buffer, and the model outputs filtered samples with a small, fixed latency.
 
-4. **Background Estimation** — A slow-adapting per-bin power estimate tracks the background (i.e., music). The adaptation rate (`noiseAlpha ≈ 0.9997`) gives a ~3-second half-life, long enough to lock onto sustained music without tracking transient speech.
-   - At voice-frequency bins, adaptation is further slowed so momentary speech doesn't corrupt the music estimate.
+4. **Strength slider** — The popup slider (0–100%) maps directly to DeepFilterNet3's attenuation limit (`suppressionLevel` 0–100). Lower values let some background music through; 100 applies maximum suppression.
 
-5. **Wiener Gain** — A per-bin gain is computed:
-   ```
-   H(k) = max(spectralFloor, 1 − overSubtract × noiseEst[k] / signal[k])
-   ```
-   - `overSubtract` controls aggressiveness. It is reduced at voice-protected bins to preserve speech.
-   - `spectralFloor` (default 0.05) prevents any bin from going fully silent, which reduces musical noise artifacts.
-
-6. **Voice-Frequency Protection** — Each FFT bin is assigned a protection weight based on its frequency:
-   | Range | Weight | Behavior |
-   |---|---|---|
-   | < 80 Hz | 0.00 | Suppress freely (sub-bass) |
-   | 80–300 Hz | 0.20 | Light protection (low fundamentals) |
-   | 300–3500 Hz | 0.85 | Strong protection (core speech formants) |
-   | 3500–8000 Hz | 0.50 | Moderate protection (sibilants) |
-   | > 8000 Hz | 0.10 | Mostly suppress (high-frequency music) |
-
-7. **IFFT + Overlap-Add** — The filtered spectrum is inverse-transformed and added back into a running output buffer. Because Hann at 50% overlap satisfies the COLA condition (sum = 1), no synthesis window or extra scaling is needed.
-
-8. **Strength Slider** — The popup slider maps 0–100% to an `overSubtract` range of 1.0–3.5. Higher values are more aggressive but may affect voice quality at the extremes.
+5. **Output** — Filtered audio flows to `AudioContext.destination` and plays normally. The visual and playback state of the original element (seek position, pause/play, volume) is unaffected.
 
 ### AudioContext Lifecycle
 
-- The `AudioContext` is created on first enable and closed on disable. Closing it automatically releases all `createMediaElementSource` bindings, restoring each element's native audio output with no leftover side effects.
+- The `AudioContext` is created on first enable and **kept alive** for the lifetime of the page. Closing it would sever the `createMediaElementSource` binding and freeze the stream, so disable instead puts the worklet into bypass mode (`SET_BYPASS: true`), passing audio through unmodified without tearing down the graph.
+- Re-enabling sends `SET_BYPASS: false` to resume DeepFilterNet3 processing immediately.
 - If the context is suspended (browser policy before user gesture), it resumes on the next click, keydown, or touchstart event.
 - A `MutationObserver` watches for dynamically added/removed `<audio>` and `<video>` elements so streams that appear after page load are also intercepted.
 
@@ -94,25 +86,36 @@ When you click **+ Add this site** in the popup, the pattern is automatically se
 
 NoMusic is not on the Chrome Web Store. Install it manually by loading the unpacked extension.
 
-**Requirements:** Google Chrome or any Chromium-based browser (Edge, Brave, Arc, etc.)
+**Requirements:**
+- Google Chrome or any Chromium-based browser (Edge, Brave, Arc, etc.)
+- Node.js 18+ and npm (for the one-time build step)
 
 **Steps:**
 
 1. Download or clone this repository to a folder on your computer.
 
-2. Open Chrome and navigate to:
+2. In a terminal, navigate to the repository root and run:
+   ```
+   npm install
+   npm run build
+   ```
+   This downloads the DeepFilterNet3 WASM binary (~9.6 MB) and model weights (~7.9 MB) into the `audio/` folder. It only needs to run once; re-run it if you update the package or delete the `audio/` assets.
+
+3. Open Chrome and navigate to:
    ```
    chrome://extensions
    ```
 
-3. Enable **Developer mode** using the toggle in the top-right corner of the Extensions page.
+4. Enable **Developer mode** using the toggle in the top-right corner of the Extensions page.
 
-4. Click **Load unpacked**.
+5. Click **Load unpacked**.
 
-5. Select the root folder of this repository (the folder that contains `manifest.json`).
+6. Select the root folder of this repository (the folder that contains `manifest.json`).
 
-6. The NoMusic extension will appear in your extensions list. Pin it to the toolbar for quick access by clicking the puzzle-piece icon and pinning NoMusic.
+7. The NoMusic extension will appear in your extensions list. Pin it to the toolbar for quick access by clicking the puzzle-piece icon and pinning NoMusic.
 
-**To update after pulling new changes:** go back to `chrome://extensions` and click the refresh icon on the NoMusic card, or click **Update** if the button appears.
+**Note on first use:** The first time you enable NoMusic on a tab, the extension loads ~17 MB of WASM and model data. Expect a brief delay (1–3 seconds on most machines) before audio processing begins.
+
+**To update after pulling new changes:** re-run `npm install && npm run build` if `package.json` changed, then go to `chrome://extensions` and click the refresh icon on the NoMusic card.
 
 **To uninstall:** click **Remove** on the NoMusic card in `chrome://extensions`.

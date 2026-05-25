@@ -43,7 +43,11 @@
 
   "web_accessible_resources": [
     {
-      "resources": ["audio/processor.worklet.js"],
+      "resources": [
+        "audio/processor.worklet.js",
+        "audio/df_bg.wasm",
+        "audio/deepfilter3.tar.gz"
+      ],
       "matches": ["<all_urls>"]
     }
   ],
