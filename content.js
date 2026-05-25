@@ -82,7 +82,7 @@ class AudioInterceptor {
     }
     // Re-activate worklet on handles that were bypassed during disable()
     for (const h of this.handles.values()) {
-      h.workletNode.port.postMessage({ type: 'SET_BYPASS', value: false });
+      h.workletNode.port.postMessage(JSON.stringify({ type: 'SET_BYPASS', value: false }));
     }
     for (const el of document.querySelectorAll('audio, video')) {
       this._attach(el);
@@ -105,7 +105,7 @@ class AudioInterceptor {
         // Put the worklet in bypass mode instead of closing the AudioContext.
         // ctx.close() disconnects the createMediaElementSource binding and
         // disrupts the media element's playback pipeline, freezing the stream.
-        h.workletNode.port.postMessage({ type: 'SET_BYPASS', value: true });
+        h.workletNode.port.postMessage(JSON.stringify({ type: 'SET_BYPASS', value: true }));
       }
     }
     for (const el of toRemove) this.handles.delete(el);
@@ -115,7 +115,7 @@ class AudioInterceptor {
   setStrength(strength) {
     this.strength = strength;
     for (const h of this.handles.values()) {
-      h.workletNode.port.postMessage({ type: 'SET_SUPPRESSION_LEVEL', value: Math.round(strength * 100) });
+      h.workletNode.port.postMessage(JSON.stringify({ type: 'SET_SUPPRESSION_LEVEL', value: Math.round(strength * 100) }));
     }
   }
 
@@ -132,13 +132,26 @@ class AudioInterceptor {
 
     let handle = null;
 
-    try {
-      const source      = this.ctx.createMediaElementSource(el);
-      const workletNode = this._makeWorkletNode();
-      source.connect(workletNode);
-      workletNode.connect(this.ctx.destination);
-      handle = { source, workletNode, strategy: 'element' };
-    } catch {
+    // Strategy 1: createMediaElementSource.
+    // IMPORTANT: once this call succeeds it permanently re-routes the element's
+    // audio through the AudioContext. If worklet creation then fails we MUST
+    // reconnect the source to ctx.destination or audio is silenced until refresh.
+    let elementSource = null;
+    try { elementSource = this.ctx.createMediaElementSource(el); } catch (_) {}
+
+    if (elementSource) {
+      try {
+        const workletNode = this._makeWorkletNode();
+        elementSource.connect(workletNode);
+        workletNode.connect(this.ctx.destination);
+        handle = { source: elementSource, workletNode, strategy: 'element' };
+      } catch (workletErr) {
+        elementSource.connect(this.ctx.destination);
+        console.warn('[NoMusic] Worklet setup failed, audio unprocessed:', workletErr.message);
+        return;
+      }
+    } else {
+      // Strategy 2: captureStream fallback (cross-origin elements).
       try {
         const stream = el.captureStream?.();
         if (!stream) throw new Error('captureStream not available');
@@ -173,17 +186,23 @@ class AudioInterceptor {
   }
 
   _makeWorkletNode() {
+    // Firefox DataCloneError: the structured-clone algorithm rejects ANY plain
+    // object literal from the extension content-script sandbox — even primitives
+    // wrapped in {} — when crossing to the AudioWorklet thread. Omitting
+    // processorOptions entirely causes the browser to supply the spec-default {}
+    // from its own context, which clones fine. The suppression level is then
+    // delivered via a JSON-string postMessage (strings are primitives, always safe).
     const node = new AudioWorkletNode(this.ctx, 'nomusic-enhancer', {
       numberOfInputs:   1,
       numberOfOutputs:  1,
       channelCount:     1,
       channelCountMode: 'explicit',
-      processorOptions: {
-        wasmModule:       this.wasmModule,
-        modelBytes:       this.modelBuffer,
-        suppressionLevel: Math.round(this.strength * 100),
-      },
     });
+    node.port.postMessage(JSON.stringify({ type: 'SET_SUPPRESSION_LEVEL', value: Math.round(this.strength * 100) }));
+    // Raw ArrayBuffer postMessage (no object wrapper) avoids the Firefox extension
+    // DataCloneError that occurs when cloning plain objects from the sandbox compartment.
+    node.port.postMessage(this.wasmModule);
+    node.port.postMessage(this.modelBuffer);
     return node;
   }
 

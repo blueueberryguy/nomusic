@@ -305,6 +305,10 @@
         SET_BYPASS: 'SET_BYPASS'
     };
 
+    // Module-level caches shared across all instances in this AudioWorkletGlobalScope.
+    let _wasmInitialized = false;
+    let _modelBuffer = null;
+
     class DeepFilterAudioProcessor extends AudioWorkletProcessor {
         constructor(options) {
             super();
@@ -341,12 +345,40 @@
                 this.isInitialized = false;
             }
         }
+        _handleBuffer(buf) {
+            this._buffersReceived++;
+            if (this._buffersReceived === 1) {
+                if (!_wasmInitialized) {
+                    initSync(buf);
+                    _wasmInitialized = true;
+                }
+            } else if (this._buffersReceived === 2) {
+                if (!_modelBuffer) {
+                    _modelBuffer = buf;
+                }
+                this._initModel();
+            }
+        }
+        _initModel() {
+            const mb = new Uint8Array(_modelBuffer);
+            const h = df_create(mb, this._suppressionLevel);
+            const fl = df_get_frame_length(h);
+            this.dfModel = { handle: h, frameLength: fl };
+            this.bufferSize = fl * 4;
+            this.inputBuffer = new Float32Array(this.bufferSize);
+            this.outputBuffer = new Float32Array(this.bufferSize);
+            this.tempFrame = new Float32Array(fl);
+            this.isInitialized = true;
+        }
         handleMessage(data) {
             switch (data.type) {
                 case WorkletMessageTypes.SET_SUPPRESSION_LEVEL:
-                    if (this.dfModel && typeof data.value === 'number') {
+                    if (typeof data.value === 'number') {
+                        this._suppressionLevel = Math.max(0, Math.min(100, Math.floor(data.value)));
+                        if (this.dfModel) {
                         const level = Math.max(0, Math.min(100, Math.floor(data.value)));
                         df_set_atten_lim(this.dfModel.handle, level);
+                        }
                     }
                     break;
                 case WorkletMessageTypes.SET_BYPASS:
