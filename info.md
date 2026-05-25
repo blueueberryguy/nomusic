@@ -82,40 +82,110 @@ When you click **+ Add this site** in the popup, the pattern is automatically se
 
 ---
 
-## Installation (Developer Mode)
+## Installation
 
-NoMusic is not on the Chrome Web Store. Install it manually by loading the unpacked extension.
+NoMusic is not on any browser extension store. Install it manually using the instructions below.
 
 **Requirements:**
-- Google Chrome or any Chromium-based browser (Edge, Brave, Arc, etc.)
 - Node.js 18+ and npm (for the one-time build step)
+- Chrome / Chromium 88+ **or** Firefox 128+
 
-**Steps:**
+---
 
-1. Download or clone this repository to a folder on your computer.
+### Step 1 — Build
 
-2. In a terminal, navigate to the repository root and run:
-   ```
-   npm install
-   npm run build
-   ```
-   This downloads the DeepFilterNet3 WASM binary (~9.6 MB) and model weights (~7.9 MB) into the `audio/` folder. It only needs to run once; re-run it if you update the package or delete the `audio/` assets.
+In a terminal, navigate to the repository root and run:
 
-3. Open Chrome and navigate to:
-   ```
-   chrome://extensions
-   ```
+```
+npm install
+npm run build
+```
 
-4. Enable **Developer mode** using the toggle in the top-right corner of the Extensions page.
+This does three things:
+1. Downloads the DeepFilterNet3 WASM binary (~9.6 MB) and model weights (~7.9 MB) into the `audio/` folder.
+2. Packages `dist/nomusic-chrome.zip` for Chrome Web Store upload.
+3. Packages `dist/nomusic-firefox.xpi` for Firefox (unsigned, for temporary/dev install).
 
-5. Click **Load unpacked**.
+Only needs to run once. Re-run if you update packages or delete the `audio/` assets.
 
-6. Select the root folder of this repository (the folder that contains `manifest.json`).
+---
 
-7. The NoMusic extension will appear in your extensions list. Pin it to the toolbar for quick access by clicking the puzzle-piece icon and pinning NoMusic.
+### Chrome / Chromium (unpacked)
 
-**Note on first use:** The first time you enable NoMusic on a tab, the extension loads ~17 MB of WASM and model data. Expect a brief delay (1–3 seconds on most machines) before audio processing begins.
+Works in Chrome, Edge, Brave, Arc, and any Chromium-based browser.
 
-**To update after pulling new changes:** re-run `npm install && npm run build` if `package.json` changed, then go to `chrome://extensions` and click the refresh icon on the NoMusic card.
+1. Open Chrome and navigate to `chrome://extensions`
+2. Enable **Developer mode** (toggle in the top-right corner).
+3. Click **Load unpacked**.
+4. Select the repository root folder (the one containing `manifest.json`).
+5. NoMusic will appear in your extensions list. Pin it to the toolbar via the puzzle-piece icon.
 
-**To uninstall:** click **Remove** on the NoMusic card in `chrome://extensions`.
+**To update after pulling changes:** re-run `npm install && npm run build` if `package.json` changed, then click the refresh icon on the NoMusic card at `chrome://extensions`.
+
+---
+
+### Firefox 128+ (XPI)
+
+The build produces `dist/nomusic-firefox.xpi` — a self-contained package with the Firefox manifest already inside.
+
+**Temporary install (no signing required — development use):**
+
+1. Open Firefox and navigate to `about:debugging#/runtime/this-firefox`
+2. Click **Load Temporary Add-on…**
+3. Select `dist/nomusic-firefox.xpi`.
+4. NoMusic will appear in the Add-ons bar for this browser session. It is removed when Firefox closes; repeat step 3 to reload it.
+
+**Permanent install (requires AMO signing or `xpinstall.signatures.required = false`):**
+
+For personal/developer use without going through the Mozilla Add-on store:
+1. In Firefox, navigate to `about:config`
+2. Set `xpinstall.signatures.required` to `false` (only available in Firefox Developer Edition or Nightly).
+3. Drag and drop `dist/nomusic-firefox.xpi` onto a Firefox window, or open it via **File → Open File**.
+
+---
+
+**Note on first use:** The first time you enable NoMusic on a tab, the extension loads ~17 MB of WASM and model data into the AudioWorklet. Expect a 1–3 second delay before audio processing begins.
+
+**To uninstall Chrome:** click **Remove** on the NoMusic card at `chrome://extensions`.
+**To uninstall Firefox:** go to `about:addons` and remove NoMusic.
+
+---
+
+## Publishing (Store Release)
+
+These steps sign and submit the extension to the Chrome Web Store and AMO (Firefox). Run `npm run build` first so the zip/xpi packages are current.
+
+### Credential setup (one-time)
+
+Copy `.env.example` to `.env` and fill in the values. The `.env` file is gitignored — never commit it.
+
+```
+cp .env.example .env
+```
+
+**Firefox (AMO):**
+1. Go to https://addons.mozilla.org/developers/addon/api/key/
+2. Generate a new JWT API credential pair.
+3. Set `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` in `.env`.
+
+**Chrome Web Store:**
+1. Go to https://chrome.google.com/webstore/devconsole and create the extension entry (first time only — upload the zip manually to get an extension ID).
+2. Follow the OAuth setup guide at https://developer.chrome.com/docs/webstore/using-api#beforeyoubegin to create a Google Cloud project, OAuth2 client, and obtain a refresh token with the `chromewebstore` scope.
+3. Set `CHROME_EXTENSION_ID`, `CHROME_CLIENT_ID`, `CHROME_CLIENT_SECRET`, and `CHROME_REFRESH_TOKEN` in `.env`.
+
+---
+
+### Release commands
+
+| Command | What it does |
+|---|---|
+| `npm run build` | Download assets + package both zips |
+| `npm run pack:chrome` | Re-package `dist/nomusic-chrome.zip` only |
+| `npm run pack:firefox` | Re-package `dist/nomusic-firefox.xpi` only |
+| `npm run publish:chrome` | Upload zip to CWS + submit for Google review |
+| `npm run sign:firefox` | Sign XPI via AMO → saves signed `.xpi` to `dist/` |
+| `npm run release` | Full pipeline: build → publish Chrome → sign Firefox |
+
+**Chrome review timeline:** Google typically takes 1–3 business days to review and publish an update.
+
+**Firefox signing:** `npm run sign:firefox` submits the extension to AMO's automated signing service and downloads the signed XPI back to `dist/`. For an unlisted extension (self-hosted), this usually completes in under 2 minutes. The signed file will be named something like `nomusic-1.0.0.xpi` in `dist/`.

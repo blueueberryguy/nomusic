@@ -5,10 +5,19 @@
   "private": true,
   "scripts": {
     "icons": "node scripts/generate-icons.js",
-    "build": "node scripts/setup-deepfilter.js",
+    "build": "node scripts/setup-deepfilter.js && node scripts/pack-chrome.js && node scripts/pack-firefox.js",
+    "pack:chrome": "node scripts/pack-chrome.js",
+    "pack:firefox": "node scripts/pack-firefox.js",
+    "publish:chrome": "node scripts/publish-chrome.js",
+    "sign:firefox": "node scripts/sign-firefox.js",
+    "release": "npm run build && npm run publish:chrome && npm run sign:firefox",
     "prepare": "npm run build"
   },
   "dependencies": {
     "deepfilternet3-noise-filter": "^1.2.1"
+  },
+  "devDependencies": {
+    "archiver": "^8.0.0",
+    "web-ext": "^10.2.0"
   }
 }
