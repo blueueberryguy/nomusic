@@ -59,6 +59,11 @@ web_modules/
 # Optional REPL history
 .node_repl_history
 
+# DeepFilterNet downloaded assets (large binaries, rebuilt by npm run build)
+audio/df_bg.wasm
+audio/deepfilter3.tar.gz
+audio/rnnoise-sync.js
+
 # Output of 'npm pack'
 *.tgz
 

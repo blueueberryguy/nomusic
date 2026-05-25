@@ -4,6 +4,11 @@
   "description": "Chrome extension base",
   "private": true,
   "scripts": {
-    "icons": "node scripts/generate-icons.js"
+    "icons": "node scripts/generate-icons.js",
+    "build": "node scripts/setup-deepfilter.js",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "deepfilternet3-noise-filter": "^1.2.1"
   }
 }
