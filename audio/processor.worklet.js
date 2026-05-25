@@ -319,10 +319,27 @@
             this.bufferSize = 8192;
             this.inputBuffer = new Float32Array(this.bufferSize);
             this.outputBuffer = new Float32Array(this.bufferSize);
-            this._suppressionLevel = options.processorOptions?.suppressionLevel ?? 50;
-            this.port.onmessage = (event) => {
-                this.handleMessage(event.data);
-            };
+            try {
+                // Initialize WASM from pre-compiled module
+                initSync(options.processorOptions.wasmModule);
+                const modelBytes = new Uint8Array(options.processorOptions.modelBytes);
+                const handle = df_create(modelBytes, options.processorOptions.suppressionLevel ?? 50);
+                const frameLength = df_get_frame_length(handle);
+                this.dfModel = { handle, frameLength };
+                this.bufferSize = frameLength * 4;
+                this.inputBuffer = new Float32Array(this.bufferSize);
+                this.outputBuffer = new Float32Array(this.bufferSize);
+                // Pre-allocate temp frame buffer for processing
+                this.tempFrame = new Float32Array(frameLength);
+                this.isInitialized = true;
+                this.port.onmessage = (event) => {
+                    this.handleMessage(event.data);
+                };
+            }
+            catch (error) {
+                console.error('Failed to initialize DeepFilter in AudioWorklet:', error);
+                this.isInitialized = false;
+            }
         }
         handleMessage(data) {
             switch (data.type) {
@@ -334,28 +351,6 @@
                     break;
                 case WorkletMessageTypes.SET_BYPASS:
                     this.bypass = Boolean(data.value);
-                    break;
-                case 'LOAD_WASM':
-                    try {
-                        initSync(data.wasmModule);
-                    } catch (_e) {
-                        console.error('[NoMusic] WASM init failed:', _e);
-                    }
-                    break;
-                case 'LOAD_MODEL':
-                    try {
-                        const _mb = new Uint8Array(data.modelBytes);
-                        const _h = df_create(_mb, this._suppressionLevel);
-                        const _fl = df_get_frame_length(_h);
-                        this.dfModel = { handle: _h, frameLength: _fl };
-                        this.bufferSize = _fl * 4;
-                        this.inputBuffer = new Float32Array(this.bufferSize);
-                        this.outputBuffer = new Float32Array(this.bufferSize);
-                        this.tempFrame = new Float32Array(_fl);
-                        this.isInitialized = true;
-                    } catch (_e) {
-                        console.error('[NoMusic] Model load failed:', _e);
-                    }
                     break;
             }
         }

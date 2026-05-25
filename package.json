@@ -1,6 +1,6 @@
 {
   "name": "nomusic-extension",
-  "version": "1.0.1",
+  "version": "1.0.0",
   "description": "Chrome extension base",
   "private": true,
   "scripts": {

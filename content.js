@@ -44,6 +44,8 @@ class AudioInterceptor {
   constructor() {
     this.ctx          = null;
     this.workletReady = false;
+    this.wasmModule   = null;  // ArrayBuffer of df_bg.wasm
+    this.modelBuffer  = null;  // ArrayBuffer of deepfilter3.tar.gz
     /** @type {Map<HTMLMediaElement, object>} */
     this.handles      = new Map();
     this.enabled      = false;
@@ -58,6 +60,14 @@ class AudioInterceptor {
     if (this.ctx) return;
     this.ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'playback' });
     await this.ctx.audioWorklet.addModule(WORKLET_URL);
+
+    const [wasmBuf, modelBuf] = await Promise.all([
+      fetch(chrome.runtime.getURL('audio/df_bg.wasm')).then(r => r.arrayBuffer()),
+      fetch(chrome.runtime.getURL('audio/deepfilter3.tar.gz')).then(r => r.arrayBuffer()),
+    ]);
+    this.wasmModule  = wasmBuf;
+    this.modelBuffer = modelBuf;
+
     this.workletReady = true;
   }
 
@@ -169,17 +179,10 @@ class AudioInterceptor {
       channelCount:     1,
       channelCountMode: 'explicit',
       processorOptions: {
+        wasmModule:       this.wasmModule,
+        modelBytes:       this.modelBuffer,
         suppressionLevel: Math.round(this.strength * 100),
       },
-    });
-    // Pass URLs rather than ArrayBuffers — Firefox blocks transfers of
-    // ArrayBuffers from the extension content-script sandbox to the
-    // AudioWorklet page-thread context (DataCloneError). The worklet
-    // fetches both resources directly; they are in web_accessible_resources.
-    node.port.postMessage({
-      type:     'LOAD',
-      wasmUrl:  chrome.runtime.getURL('audio/df_bg.wasm'),
-      modelUrl: chrome.runtime.getURL('audio/deepfilter3.tar.gz'),
     });
     return node;
   }
