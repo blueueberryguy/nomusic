@@ -77,6 +77,7 @@ async function main() {
   try {
     await webExt.cmd.sign(
       {
+        amoBaseUrl:   'https://addons.mozilla.org/api/v5/',
         sourceDir:    STAGING,
         artifactsDir: DIST,
         channel:      'unlisted',

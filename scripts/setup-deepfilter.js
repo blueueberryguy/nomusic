@@ -34,6 +34,26 @@ function extractWorkletCode() {
     "registerProcessor('nomusic-enhancer',"
   );
 
+  // ── Firefox fix: nothing large in processorOptions ───────────────────────────
+  // Firefox rejects structured-clone of both large ArrayBuffers AND
+  // WebAssembly.Module objects when passed via AudioWorkletNode processorOptions.
+  // Solution: processorOptions carries only the plain number suppressionLevel;
+  // WASM module and model bytes are delivered via port.postMessage after the node
+  // is created, which uses a separate (working) cross-thread transfer path.
+
+  // Patch 1 — constructor: strip entire try/catch, just store suppressionLevel
+  // and always set up port.onmessage so messages can be received immediately.
+  decoded = decoded.replace(
+    `            try {\n                // Initialize WASM from pre-compiled module\n                initSync(options.processorOptions.wasmModule);\n                const modelBytes = new Uint8Array(options.processorOptions.modelBytes);\n                const handle = df_create(modelBytes, options.processorOptions.suppressionLevel ?? 50);\n                const frameLength = df_get_frame_length(handle);\n                this.dfModel = { handle, frameLength };\n                this.bufferSize = frameLength * 4;\n                this.inputBuffer = new Float32Array(this.bufferSize);\n                this.outputBuffer = new Float32Array(this.bufferSize);\n                // Pre-allocate temp frame buffer for processing\n                this.tempFrame = new Float32Array(frameLength);\n                this.isInitialized = true;\n                this.port.onmessage = (event) => {\n                    this.handleMessage(event.data);\n                };\n            }\n            catch (error) {\n                console.error('Failed to initialize DeepFilter in AudioWorklet:', error);\n                this.isInitialized = false;\n            }`,
+    `            this._suppressionLevel = options.processorOptions?.suppressionLevel ?? 50;\n            this.port.onmessage = (event) => {\n                this.handleMessage(event.data);\n            };`
+  );
+
+  // Patch 2 — handleMessage: add LOAD_WASM (initSync) and LOAD_MODEL (df_create)
+  decoded = decoded.replace(
+    `case WorkletMessageTypes.SET_BYPASS:\n                    this.bypass = Boolean(data.value);\n                    break;\n            }\n        }`,
+    `case WorkletMessageTypes.SET_BYPASS:\n                    this.bypass = Boolean(data.value);\n                    break;\n                case 'LOAD_WASM':\n                    try {\n                        initSync(data.wasmModule);\n                    } catch (_e) {\n                        console.error('[NoMusic] WASM init failed:', _e);\n                    }\n                    break;\n                case 'LOAD_MODEL':\n                    try {\n                        const _mb = new Uint8Array(data.modelBytes);\n                        const _h = df_create(_mb, this._suppressionLevel);\n                        const _fl = df_get_frame_length(_h);\n                        this.dfModel = { handle: _h, frameLength: _fl };\n                        this.bufferSize = _fl * 4;\n                        this.inputBuffer = new Float32Array(this.bufferSize);\n                        this.outputBuffer = new Float32Array(this.bufferSize);\n                        this.tempFrame = new Float32Array(_fl);\n                        this.isInitialized = true;\n                    } catch (_e) {\n                        console.error('[NoMusic] Model load failed:', _e);\n                    }\n                    break;\n            }\n        }`
+  );
+
   return decoded;
 }
 
