@@ -64,6 +64,12 @@ audio/df_bg.wasm
 audio/deepfilter3.tar.gz
 audio/rnnoise-sync.js
 
+# Build output
+dist/
+
+# Credentials — never commit
+.env
+
 # Output of 'npm pack'
 *.tgz
 

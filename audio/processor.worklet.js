@@ -305,6 +305,10 @@
         SET_BYPASS: 'SET_BYPASS'
     };
 
+    // Module-level caches shared across all instances in this AudioWorkletGlobalScope.
+    let _wasmInitialized = false;
+    let _modelBuffer = null;
+
     class DeepFilterAudioProcessor extends AudioWorkletProcessor {
         constructor(options) {
             super();
@@ -319,34 +323,53 @@
             this.bufferSize = 8192;
             this.inputBuffer = new Float32Array(this.bufferSize);
             this.outputBuffer = new Float32Array(this.bufferSize);
-            try {
-                // Initialize WASM from pre-compiled module
-                initSync(options.processorOptions.wasmModule);
-                const modelBytes = new Uint8Array(options.processorOptions.modelBytes);
-                const handle = df_create(modelBytes, options.processorOptions.suppressionLevel ?? 50);
-                const frameLength = df_get_frame_length(handle);
-                this.dfModel = { handle, frameLength };
-                this.bufferSize = frameLength * 4;
-                this.inputBuffer = new Float32Array(this.bufferSize);
-                this.outputBuffer = new Float32Array(this.bufferSize);
-                // Pre-allocate temp frame buffer for processing
-                this.tempFrame = new Float32Array(frameLength);
-                this.isInitialized = true;
-                this.port.onmessage = (event) => {
-                    this.handleMessage(event.data);
-                };
+            this._suppressionLevel = 50;
+            this._buffersReceived = 0;
+            // Firefox extension sandbox cannot structured-clone objects to the AudioWorklet
+            // thread. content.js sends WASM+model as raw ArrayBuffers (no object wrapper),
+            // which bypasses the DataCloneError restriction. Strings are safe primitives.
+            this.port.onmessage = (event) => {
+                if (typeof event.data === 'string') {
+                    this.handleMessage(JSON.parse(event.data));
+                } else if (event.data instanceof ArrayBuffer) {
+                    this._handleBuffer(event.data);
+                }
+            };
+        }
+        _handleBuffer(buf) {
+            this._buffersReceived++;
+            if (this._buffersReceived === 1) {
+                if (!_wasmInitialized) {
+                    initSync(buf);
+                    _wasmInitialized = true;
+                }
+            } else if (this._buffersReceived === 2) {
+                if (!_modelBuffer) {
+                    _modelBuffer = buf;
+                }
+                this._initModel();
             }
-            catch (error) {
-                console.error('Failed to initialize DeepFilter in AudioWorklet:', error);
-                this.isInitialized = false;
-            }
+        }
+        _initModel() {
+            const mb = new Uint8Array(_modelBuffer);
+            const h = df_create(mb, this._suppressionLevel);
+            const fl = df_get_frame_length(h);
+            this.dfModel = { handle: h, frameLength: fl };
+            this.bufferSize = fl * 4;
+            this.inputBuffer = new Float32Array(this.bufferSize);
+            this.outputBuffer = new Float32Array(this.bufferSize);
+            this.tempFrame = new Float32Array(fl);
+            this.isInitialized = true;
         }
         handleMessage(data) {
             switch (data.type) {
                 case WorkletMessageTypes.SET_SUPPRESSION_LEVEL:
-                    if (this.dfModel && typeof data.value === 'number') {
+                    if (typeof data.value === 'number') {
                         const level = Math.max(0, Math.min(100, Math.floor(data.value)));
-                        df_set_atten_lim(this.dfModel.handle, level);
+                        this._suppressionLevel = level;
+                        if (this.dfModel) {
+                            df_set_atten_lim(this.dfModel.handle, level);
+                        }
                     }
                     break;
                 case WorkletMessageTypes.SET_BYPASS:
@@ -366,7 +389,6 @@
             if (!input) {
                 return true;
             }
-            // Passthrough mode - copy input to all output channels
             if (!this.isInitialized || !this.dfModel || this.bypass || !this.tempFrame) {
                 for (let inputNum = 0; inputNum < sourceLimit; inputNum++) {
                     const output = outputList[inputNum];
@@ -377,20 +399,17 @@
                 }
                 return true;
             }
-            // Write input to ring buffer
             for (let i = 0; i < input.length; i++) {
                 this.inputBuffer[this.inputWritePos] = input[i];
                 this.inputWritePos = (this.inputWritePos + 1) % this.bufferSize;
             }
             const frameLength = this.dfModel.frameLength;
             while (this.getInputAvailable() >= frameLength) {
-                // Extract frame from ring buffer
                 for (let i = 0; i < frameLength; i++) {
                     this.tempFrame[i] = this.inputBuffer[this.inputReadPos];
                     this.inputReadPos = (this.inputReadPos + 1) % this.bufferSize;
                 }
                 const processed = df_process_frame(this.dfModel.handle, this.tempFrame);
-                // Write to output ring buffer
                 for (let i = 0; i < processed.length; i++) {
                     this.outputBuffer[this.outputWritePos] = processed[i];
                     this.outputWritePos = (this.outputWritePos + 1) % this.bufferSize;
