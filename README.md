@@ -1,6 +1,6 @@
 # nomusic
 
-NoMusic is a Chrome extension that removes background music from video and audio streams in real time, leaving only the human voice. It works on any site without requiring page-specific configuration.
+NoMusic is a browser extension that removes background music from video and audio streams in real time, leaving only the human voice. It works on any site without requiring page-specific configuration.
 See info.md
 
 # Bro I cannot stand pikaboo's music playlist anymore. 
