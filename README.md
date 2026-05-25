@@ -1,8 +1,6 @@
 # nomusic
 
-Bro I cannot stand pikaboo's music playlist anymore. 
-
-Yes, AI dogslop.
+# Bro I cannot stand pikaboo's music playlist anymore. 
 
 
 <img width="687" height="688" alt="{DB8B3EB4-9A1C-4051-8083-14730369A8A9}" src="https://github.com/user-attachments/assets/8ad173b2-9961-4fca-a139-999dbcc04c5c" />
