@@ -30,6 +30,7 @@ function buildFirefoxManifest() {
 
   base.browser_specific_settings = {
     gecko: {
+      ...((base.browser_specific_settings || {}).gecko || {}),
       id: 'nomusic@nomusic',
       strict_min_version: '109.0',
     },
